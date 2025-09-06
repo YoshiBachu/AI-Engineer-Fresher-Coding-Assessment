@@ -1,4 +1,4 @@
-import os
+mport os
 import re
 import base64
 import email
@@ -29,6 +29,8 @@ def authenticate_gmail():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            if not os.path.exists("credentials.json"):
+                raise FileNotFoundError("Missing credentials.json for Gmail API")
             flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
             creds = flow.run_local_server(port=0)
         with open('token.pickle', 'wb') as token:
@@ -57,14 +59,15 @@ def fetch_gmail_emails(service, max_results=20):
             if d['name'] == 'Date':
                 date = d['value']
 
-        # Extract email body
+        # Extract email body (handle plain text + HTML fallback)
         body = ""
-        if 'data' in payload['body']:
-            body = base64.urlsafe_b64decode(payload['body']['data']).decode()
-        elif 'parts' in payload:
-            for part in payload['parts']:
-                if part['mimeType'] == 'text/plain':
-                    body = base64.urlsafe_b64decode(part['body']['data']).decode()
+        if "body" in payload and "data" in payload["body"]:
+            body = base64.urlsafe_b64decode(payload["body"]["data"]).decode(errors="ignore")
+        elif "parts" in payload:
+            for part in payload["parts"]:
+                if part["mimeType"] in ["text/plain", "text/html"]:
+                    if "data" in part["body"]:
+                        body = base64.urlsafe_b64decode(part["body"]["data"]).decode(errors="ignore")
 
         emails.append({"sender": sender, "subject": subject, "body": body, "sent_date": date})
 
@@ -88,15 +91,20 @@ def send_gmail(service, to, subject, body):
 # -------------------------------
 
 # Models and keywords
-sentiment_model = pipeline("sentiment-analysis")
+sentiment_model = pipeline(
+    "sentiment-analysis",
+    model="distilbert-base-uncased-finetuned-sst-2-english"  # ✅ safer model
+)
 filter_keywords = ["support", "query", "request", "help"]
 priority_keywords = ["urgent", "critical", "immediate", "cannot access", "downtime", "blocked"]
 request_keywords = ["login", "subscription", "billing", "refund", "integration", "verification", "access", "password"]
 
 def get_sentiment(text):
     try:
+        if not text.strip():  # ✅ handle empty body
+            return "Neutral"
         return sentiment_model(text[:512])[0]['label']
-    except:
+    except Exception:
         return "Neutral"
 
 def detect_priority(text):
@@ -133,9 +141,15 @@ def generate_reply(row):
 
 def process_emails(df):
     """Apply filtering, categorization, extraction, and draft replies."""
-    df = df[df['subject'].str.lower().str.contains('|'.join(filter_keywords))].copy()
+    if df.empty:
+        return df
+
+    df = df[df['subject'].str.lower().str.contains('|'.join(filter_keywords), na=False)].copy()
+    if df.empty:
+        return df
+
     df['sentiment'] = df['body'].apply(get_sentiment)
-    df['priority'] = (df['subject'] + " " + df['body']).apply(detect_priority)
+    df['priority'] = (df['subject'].fillna('') + " " + df['body'].fillna('')).apply(detect_priority)
     df['contacts'] = df['body'].apply(extract_contacts)
     df['requests'] = df['body'].apply(extract_requests)
     df['draft_reply'] = df.apply(generate_reply, axis=1)
@@ -161,10 +175,18 @@ if data_source == "Gmail API":
         st.error("⚠️ Gmail API error: " + str(e))
         st.stop()
 else:
-    raw_df = pd.read_csv("Sample_Support_Emails.csv")
+    try:
+        raw_df = pd.read_csv("Sample_Support_Emails.csv")
+    except FileNotFoundError:
+        st.error("⚠️ Missing Sample_Support_Emails.csv file! Please add it to the project folder.")
+        st.stop()
 
 # Process emails
 df_processed = process_emails(raw_df)
+
+if df_processed.empty:
+    st.warning("No support-related emails found.")
+    st.stop()
 
 # Sidebar filters
 priority_filter = st.sidebar.multiselect("Filter by Priority", df_processed["priority"].unique(), default=df_processed["priority"].unique())
@@ -208,4 +230,4 @@ for idx, row in filtered_df.iterrows():
                 except Exception as e:
                     st.error(f"❌ Failed to send email: {e}")
             else:
-                st.info("📌 CSV Mode: Reply not actually sent (demo only).")
+                st.info("📌 CSV Mode: Reply not actually sent (demo only)."
