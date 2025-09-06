@@ -1,0 +1,211 @@
+import os
+import re
+import base64
+import email
+import pickle
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+from transformers import pipeline
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+
+
+# -------------------------------
+# Gmail API Setup
+# -------------------------------
+
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
+
+def authenticate_gmail():
+    """Authenticate user with Gmail API and return a service object."""
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+
+    return build('gmail', 'v1', credentials=creds)
+
+
+def fetch_gmail_emails(service, max_results=20):
+    """Fetch recent emails from Gmail."""
+    results = service.users().messages().list(userId='me', maxResults=max_results).execute()
+    messages = results.get('messages', [])
+    emails = []
+
+    for msg in messages:
+        txt = service.users().messages().get(userId='me', id=msg['id']).execute()
+        payload = txt['payload']
+        headers = payload['headers']
+
+        subject, sender, date = "", "", ""
+        for d in headers:
+            if d['name'] == 'Subject':
+                subject = d['value']
+            if d['name'] == 'From':
+                sender = d['value']
+            if d['name'] == 'Date':
+                date = d['value']
+
+        # Extract email body
+        body = ""
+        if 'data' in payload['body']:
+            body = base64.urlsafe_b64decode(payload['body']['data']).decode()
+        elif 'parts' in payload:
+            for part in payload['parts']:
+                if part['mimeType'] == 'text/plain':
+                    body = base64.urlsafe_b64decode(part['body']['data']).decode()
+
+        emails.append({"sender": sender, "subject": subject, "body": body, "sent_date": date})
+
+    return pd.DataFrame(emails)
+
+
+def send_gmail(service, to, subject, body):
+    """Send an email reply through Gmail API."""
+    message = email.message.EmailMessage()
+    message.set_content(body)
+    message['To'] = to
+    message['From'] = "me"
+    message['Subject'] = subject
+
+    encoded = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    return service.users().messages().send(userId="me", body={'raw': encoded}).execute()
+
+
+# -------------------------------
+# Email Processing Logic
+# -------------------------------
+
+# Models and keywords
+sentiment_model = pipeline("sentiment-analysis")
+filter_keywords = ["support", "query", "request", "help"]
+priority_keywords = ["urgent", "critical", "immediate", "cannot access", "downtime", "blocked"]
+request_keywords = ["login", "subscription", "billing", "refund", "integration", "verification", "access", "password"]
+
+def get_sentiment(text):
+    try:
+        return sentiment_model(text[:512])[0]['label']
+    except:
+        return "Neutral"
+
+def detect_priority(text):
+    text = text.lower()
+    return "Urgent" if any(word in text for word in priority_keywords) else "Normal"
+
+def extract_contacts(text):
+    emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}", text)
+    phones = re.findall(r"\+?\d[\d -]{8,}\d", text)
+    return {"emails": emails, "phones": phones}
+
+def extract_requests(text):
+    found = [word for word in request_keywords if word in text.lower()]
+    return found if found else ["general inquiry"]
+
+def generate_reply(row):
+    # Greeting depending on urgency
+    opening = "We understand this is urgent and apologize for the inconvenience." if row['priority'] == "Urgent" \
+              else "Thank you for reaching out to our support team."
+
+    # Tone depending on sentiment
+    if row['sentiment'] == "NEGATIVE":
+        empathy = "We understand your frustration and will resolve this quickly."
+    elif row['sentiment'] == "POSITIVE":
+        empathy = "We appreciate your patience and positive attitude."
+    else:
+        empathy = "We are reviewing your case and will get back with updates."
+
+    # Add detail from requests
+    detail = f"Our team is looking into: {', '.join(row['requests'])}."
+    closing = "You will hear from us shortly with further updates."
+
+    return f"{opening}\n\n{empathy}\n\n{detail}\n\n{closing}"
+
+def process_emails(df):
+    """Apply filtering, categorization, extraction, and draft replies."""
+    df = df[df['subject'].str.lower().str.contains('|'.join(filter_keywords))].copy()
+    df['sentiment'] = df['body'].apply(get_sentiment)
+    df['priority'] = (df['subject'] + " " + df['body']).apply(detect_priority)
+    df['contacts'] = df['body'].apply(extract_contacts)
+    df['requests'] = df['body'].apply(extract_requests)
+    df['draft_reply'] = df.apply(generate_reply, axis=1)
+    return df
+
+
+# -------------------------------
+# Streamlit Dashboard
+# -------------------------------
+
+st.set_page_config(page_title="AI Email Assistant", layout="wide")
+st.title("📧 AI-Powered Email Communication Assistant")
+
+# Choose data source
+data_source = st.sidebar.radio("📥 Data Source", ["Gmail API", "Sample CSV"])
+
+if data_source == "Gmail API":
+    st.sidebar.write("Authenticate with Gmail")
+    try:
+        service = authenticate_gmail()
+        raw_df = fetch_gmail_emails(service, max_results=20)
+    except Exception as e:
+        st.error("⚠️ Gmail API error: " + str(e))
+        st.stop()
+else:
+    raw_df = pd.read_csv("Sample_Support_Emails.csv")
+
+# Process emails
+df_processed = process_emails(raw_df)
+
+# Sidebar filters
+priority_filter = st.sidebar.multiselect("Filter by Priority", df_processed["priority"].unique(), default=df_processed["priority"].unique())
+sentiment_filter = st.sidebar.multiselect("Filter by Sentiment", df_processed["sentiment"].unique(), default=df_processed["sentiment"].unique())
+
+filtered_df = df_processed[df_processed["priority"].isin(priority_filter) & df_processed["sentiment"].isin(sentiment_filter)]
+
+# Analytics
+st.subheader("📊 Analytics Overview")
+col1, col2 = st.columns(2)
+
+with col1:
+    st.write("### Priority Distribution")
+    df_processed["priority"].value_counts().plot(kind="bar")
+    st.pyplot(plt.gcf())
+    plt.clf()
+
+with col2:
+    st.write("### Sentiment Distribution")
+    df_processed["sentiment"].value_counts().plot(kind="bar")
+    st.pyplot(plt.gcf())
+    plt.clf()
+
+# Show emails
+st.subheader("📬 Support Emails")
+for idx, row in filtered_df.iterrows():
+    with st.expander(f"{row['subject']} | {row['sender']} | {row['priority']} | {row['sentiment']}"):
+        st.write(f"*Sent On:* {row['sent_date']}")
+        st.write(f"*Body:* {row['body']}")
+        st.write(f"*Contacts Found:* {row['contacts']}")
+        st.write(f"*Requests Detected:* {row['requests']}")
+
+        # Editable draft reply
+        draft = st.text_area(f"Draft Reply to {row['sender']}", value=row['draft_reply'], height=150, key=f"draft_{idx}")
+
+        if st.button(f"✉️ Send Reply to {row['sender']}", key=f"send_{idx}"):
+            if data_source == "Gmail API":
+                try:
+                    send_gmail(service, row['sender'], f"Re: {row['subject']}", draft)
+                    st.success(f"✅ Reply sent to {row['sender']}")
+                except Exception as e:
+                    st.error(f"❌ Failed to send email: {e}")
+            else:
+                st.info("📌 CSV Mode: Reply not actually sent (demo only).")
